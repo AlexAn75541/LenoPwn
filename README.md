@@ -30,8 +30,8 @@ Once the original service is disabled, you can proceed with the LenoPwn installa
 
 ## Target Platform
 
--   **Primary Target**: Lenovo Yoga Slim 7X (ARM64)
--   **Compatibility**: May work with other Lenovo laptops (x86/x64) that support the necessary `LENOVO_UTILITY_EVENT` WMI class. This requires building from the source code.
+-   **Primary Target**: Lenovo Yoga Slim 7X (ARM64)(Original Repo) and 2026 ThinkBooks(Intended purpose for this fork).
+-   **Compatibility**: ~~May work with other Lenovo laptops (x86/x64) that support the necessary `LENOVO_UTILITY_EVENT` WMI class. This requires building from the source code.~~ Setup files for both architecture(x64/arm64) has been compiled in the latest commit in [Action](https://github.com/AlexAn75541/LenoPwn/actions) part of this project, under Artifacts section. Lenovo Laptops in general is required for this project to work(ofc that `LENOVO_UTILITY_EVENT` WMI class has to be in place too).
 
 ## Features
 
