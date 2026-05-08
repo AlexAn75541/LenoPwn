@@ -26,12 +26,18 @@ To disable it:
 5.  Click **Stop** to terminate the service if it is running.
 6.  Click **Apply** and **OK**.
 
+Or, for a somewhat more "optimized" way to disable it:
+1. Install [LenovoLegionToolkit](https://github.com/LenovoLegionToolkit-Team/LenovoLegionToolkit) either from the [Release](https://github.com/LenovoLegionToolkit-Team/LenovoLegionToolkit/releases) tab or at the newest `dev` build from [Action](https://github.com/LenovoLegionToolkit-Team/LenovoLegionToolkit/actions).
+2. Once done with the app setup, head over to Settings -> Software Control.
+3. Disable LenovoHotkey(Might as well disable LenovoVantage because LenovoLegionToolkit is somewhat a lighter, open-source alternative to Vantage and cannot be working alongside, you have to use either of them).
+4. And then done! Now you can proceed with this LenoPwn setup process.
+
 Once the original service is disabled, you can proceed with the LenoPwn installation.
 
 ## Target Platform
 
 -   **Primary Target**: Lenovo Yoga Slim 7X (ARM64)(Original Repo) and 2026 ThinkBooks(Intended purpose for this fork).
--   **Compatibility**: ~~May work with other Lenovo laptops (x86/x64) that support the necessary `LENOVO_UTILITY_EVENT` WMI class. This requires building from the source code.~~ Setup files for both architecture(x64/arm64) has been compiled in the latest commit in [Action](https://github.com/AlexAn75541/LenoPwn/actions) part of this project, under Artifacts section. Lenovo Laptops in general is required for this project to work(ofc that `LENOVO_UTILITY_EVENT` WMI class has to be in place too).
+-   **Compatibility**: ~~May work with other Lenovo laptops (x86/x64) that support the necessary `LENOVO_UTILITY_EVENT` WMI class. This requires building from the source code.~~ Setup files for both architecture(x64/arm64) has been compiled in the latest commit in [Action](https://github.com/AlexAn75541/LenoPwn/actions) part of this project, under Artifacts section. Lenovo Laptops in general are required for this project to work(ofc that `LENOVO_UTILITY_EVENT` WMI class has to be in place too).
 
 ## Features
 
