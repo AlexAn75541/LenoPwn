@@ -1,0 +1,6 @@
+.vs/
+**/bin/
+**/obj/
+*.user
+UpgradeLog*.htm
+LenoPwn.Installer/HeatWaveConvert.log

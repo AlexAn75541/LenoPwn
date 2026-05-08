@@ -10,7 +10,10 @@
 
 		<PublishSingleFile>true</PublishSingleFile>
 		<SelfContained>true</SelfContained>
-		<RuntimeIdentifier>win-arm64</RuntimeIdentifier>
+		<RuntimeIdentifiers>win-arm64;win-x64</RuntimeIdentifiers>
+		<RuntimeIdentifier Condition="'$(Platform)' == 'x64'">win-x64</RuntimeIdentifier>
+		<RuntimeIdentifier Condition="'$(Platform)' == 'ARM64'">win-arm64</RuntimeIdentifier>
+		<RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-arm64</RuntimeIdentifier>
 		<IncludeAllContentForSelfExtract>true</IncludeAllContentForSelfExtract>
 
 	</PropertyGroup>
@@ -34,7 +37,7 @@
 	</ItemGroup>
 
 	<Target Name="PublishForInstaller" AfterTargets="Build">
-		<Exec Command="dotnet publish -c $(Configuration) -r $(RuntimeIdentifier) --no-build --output &quot;$(TargetDir)publish\&quot;" />
+		<Exec Command="dotnet publish &quot;$(MSBuildProjectFullPath)&quot; -c $(Configuration) -p:Platform=&quot;$(Platform)&quot; -r $(RuntimeIdentifier) --no-build --output &quot;$(TargetDir)publish\&quot;" />
 	</Target>
 
 </Project>

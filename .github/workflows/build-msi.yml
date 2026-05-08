@@ -1,0 +1,137 @@
+name: Build and Release MSI
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: "Target architecture to build"
+        required: true
+        type: choice
+        default: both
+        options:
+          - x64
+          - ARM64
+          - both
+      version:
+        description: "Release version tag without the leading v"
+        required: true
+        default: 0.1.0
+        type: string
+      publish_release:
+        description: "Create a GitHub Release and upload MSI assets"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.define.outputs.matrix }}
+      release_tag: ${{ steps.define.outputs.release_tag }}
+      publish_release: ${{ steps.define.outputs.publish_release }}
+    steps:
+      - name: Define build matrix
+        id: define
+        shell: pwsh
+        env:
+          SELECTED_ARCH: ${{ github.event_name == 'workflow_dispatch' && inputs.arch || 'both' }}
+          RELEASE_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || '0.1.0' }}
+          PUBLISH_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release || 'false' }}
+        run: |
+          $matrix = switch ($env:SELECTED_ARCH) {
+            'x64' {
+              '[{"platform":"x64","runtimeIdentifier":"win-x64"}]'
+            }
+            'ARM64' {
+              '[{"platform":"ARM64","runtimeIdentifier":"win-arm64"}]'
+            }
+            default {
+              '[{"platform":"x64","runtimeIdentifier":"win-x64"},{"platform":"ARM64","runtimeIdentifier":"win-arm64"}]'
+            }
+          }
+
+          "matrix=$matrix" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "release_tag=v$env:RELEASE_VERSION" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "publish_release=$env:PUBLISH_RELEASE" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+  build:
+    needs: plan
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up .NET 8 SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Restore
+        run: dotnet restore LenoPwn.sln
+
+      - name: Accept WiX v7 EULA
+        run: dotnet msbuild LenoPwn.Installer/LenoPwn.Installer.wixproj -t:AcceptEula -p:EulaId=wix7
+
+      - name: Build MSI for ${{ matrix.platform }}
+        run: >
+          dotnet build LenoPwn.Installer/LenoPwn.Installer.wixproj
+          --configuration Release
+          -p:Platform=${{ matrix.platform }}
+          -p:RuntimeIdentifier=${{ matrix.runtimeIdentifier }}
+          --no-restore
+
+      - name: Collect MSI
+        shell: pwsh
+        run: |
+          $artifactDir = Join-Path $PWD "artifacts"
+          New-Item -ItemType Directory -Force $artifactDir | Out-Null
+
+          $msi = Get-ChildItem -Recurse -Filter *.msi |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+
+          if (-not $msi) {
+            throw "No MSI was produced for ${{ matrix.platform }}."
+          }
+
+          Copy-Item $msi.FullName (Join-Path $artifactDir "LenoPwn-${{ matrix.platform }}.msi")
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LenoPwn-${{ matrix.platform }}-msi
+          path: artifacts/*.msi
+          if-no-files-found: error
+
+  release:
+    needs: [plan, build]
+    if: github.event_name == 'workflow_dispatch' && needs.plan.outputs.publish_release == 'true'
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all MSI artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.plan.outputs.release_tag }}
+          name: ${{ needs.plan.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          files: release-artifacts/**/*.msi
+          generate_release_notes: true
+          fail_on_unmatched_files: true

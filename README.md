@@ -68,14 +68,18 @@ Once the original service is disabled, you can proceed with the LenoPwn installa
 #### Prerequisites
 -   Visual Studio 2022 or later
 -   .NET 8.0 SDK
--   WiX Toolset v5 (required to build the installer)
+-   WiX Toolset v7 (required to build the installer)
 
 #### Build Steps
 ```bash
 git clone [https://github.com/NexuaTCN/LenoPwn.git](https://github.com/your-username/LenoPwn.git)
 cd LenoPwn
+
 dotnet restore
-dotnet build --configuration Release
+
+dotnet build --configuration Release -p:Platform=ARM64
+
+dotnet build --configuration Release -p:Platform=x64
 ```
 
 #### Manual Installation (For Development)
