@@ -103,14 +103,17 @@ namespace LenoPwn.Agent
                                             string theme = parts[2];
                                             try
                                             {
-                                                System.Windows.Application.Current.Dispatcher.Invoke(() =>
+                                                if (_notificationWindow.IsValueCreated)
                                                 {
-                                                    _notificationWindow.Value.ShowNotification(iconToShow, theme);
-                                                });
+                                                    System.Windows.Application.Current?.Dispatcher?.Invoke(() =>
+                                                    {
+                                                        _notificationWindow.Value?.ShowNotification(iconToShow, theme);
+                                                    });
+                                                }
                                             }
                                             catch (Exception)
                                             {
-
+                                                // UI errors are silently suppressed to prevent crashes
                                             }
                                         }
                                         break;
@@ -140,13 +143,14 @@ namespace LenoPwn.Agent
                     }
                     catch (Exception)
                     {
+                        // Pipe server errors - retry connection after delay
                         await Task.Delay(5000, token);
                     }
                 }
             }
             catch (Exception)
             {
-
+                // Unhandled exception - agent will shut down
             }
         }
     }

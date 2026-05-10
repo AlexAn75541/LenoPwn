@@ -1,5 +1,6 @@
 ﻿using NAudio.CoreAudioApi;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -22,6 +23,7 @@ namespace LenoPwn.Service
     {
         private const string PipeName = "LenoPwnPipe";
         private const string ConfigFileName = "hotkey_map.json";
+        private const int DebouncingDelayMs = 100; // Debounce hotkey events
         private ManagementEventWatcher? _watcher;
         private CancellationTokenSource? _cancellationTokenSource;
         private NamedPipeClientStream? _pipeClient;
@@ -34,6 +36,9 @@ namespace LenoPwn.Service
         private AppConfig? _cachedConfig;
         private FileSystemWatcher? _configWatcher;
         private readonly object _configLock = new object();
+        private readonly object _audioLock = new object(); // Synchronize audio device access
+        private readonly object _pipeLock = new object(); // Synchronize pipe writes
+        private ConcurrentDictionary<uint, DateTime> _lastKeyPressTime = new(); // Track last key press for debouncing - thread-safe
 
         public LenoPwnService()
         {
@@ -93,6 +98,7 @@ namespace LenoPwn.Service
                         Log("Attempting to connect to agent pipe...");
 
                         await _pipeClient.ConnectAsync(5000, token);
+                        _pipeClient.WriteTimeout = 1000; // Set timeout once after connection
                         _pipeWriter = new StreamWriter(_pipeClient, Encoding.UTF8) { AutoFlush = true };
                         Log("Successfully connected to agent pipe!");
 
@@ -132,6 +138,17 @@ namespace LenoPwn.Service
         private void OnEventArrived(object sender, EventArrivedEventArgs e)
         {
             if (e.NewEvent.GetPropertyValue("PressTypeDataVal") is not uint keyCode) return;
+
+            // Debounce rapid key presses
+            var now = DateTime.UtcNow;
+            if (_lastKeyPressTime.TryGetValue(keyCode, out var lastTime))
+            {
+                if ((now - lastTime).TotalMilliseconds < DebouncingDelayMs)
+                {
+                    return; // Ignore debounced event
+                }
+            }
+            _lastKeyPressTime.AddOrUpdate(keyCode, now, (k, v) => now);
 
             AppConfig? config;
             lock (_configLock)
@@ -204,15 +221,21 @@ namespace LenoPwn.Service
                     string iconName = payloadStr;
                     if (payloadStr == "toggle_mic_mute")
                     {
-                        ToggleCoreAudioMuteAndLed();
-                        iconName = (_micDevice?.AudioEndpointVolume.Mute ?? false) ? "microphone_mute" : "microphone_unmute";
+                        lock (_audioLock)
+                        {
+                            ToggleCoreAudioMuteAndLed();
+                            iconName = (_micDevice?.AudioEndpointVolume.Mute ?? false) ? "microphone_mute" : "microphone_unmute";
+                        }
                     }
                     else if (payloadStr == "toggle_speaker_mute")
                     {
-                        ToggleCoreAudioSpeakerMuteAndLed();
-                        iconName = (_speakerDevice?.AudioEndpointVolume.Mute ?? false) ? "speaker_mute" : "speaker_unmute";
+                        lock (_audioLock)
+                        {
+                            ToggleCoreAudioSpeakerMuteAndLed();
+                            iconName = (_speakerDevice?.AudioEndpointVolume.Mute ?? false) ? "speaker_mute" : "speaker_unmute";
+                        }
                     }
-                    if (mapping.ShowPopup) ShowPopup(iconName);
+                    if (mapping.ShowPopup) SendCommandToAgent($"show_icon::{iconName}::{_currentTheme}");
                     break;
             }
         }
@@ -221,13 +244,31 @@ namespace LenoPwn.Service
 
         private void SendCommandToAgent(string command)
         {
-            if (_pipeClient?.IsConnected == true && _pipeWriter != null)
+            lock (_pipeLock)
             {
-                try
+                if (_pipeClient?.IsConnected == true && _pipeWriter != null)
                 {
-                    _pipeWriter.WriteLine(command);
+                    try
+                    {
+                        _pipeWriter.WriteLine(command);
+                    }
+                    catch (IOException ex)
+                    {
+                        Log($"Pipe write error: {ex.Message}", EventLogEntryType.Warning);
+                        _pipeClient?.Dispose();
+                        _pipeClient = null;
+                        _pipeWriter?.Dispose();
+                        _pipeWriter = null;
+                    }
+                    catch (System.TimeoutException ex)
+                    {
+                        Log($"Pipe write timeout: {ex.Message}", EventLogEntryType.Warning);
+                        _pipeClient?.Dispose();
+                        _pipeClient = null;
+                        _pipeWriter?.Dispose();
+                        _pipeWriter = null;
+                    }
                 }
-                catch (IOException ex) { Log($"Pipe write error: {ex.Message}", EventLogEntryType.Warning); }
             }
         }
 
@@ -343,13 +384,46 @@ namespace LenoPwn.Service
         {
             try
             {
-                _deviceEnumerator = new MMDeviceEnumerator();
-                _micDevice = _deviceEnumerator.GetDefaultAudioEndpoint(DataFlow.Capture, Role.Communications);
-                _micDevice.AudioEndpointVolume.OnVolumeNotification += (data) => WmiController.SetMicMuteLedState(data.Muted);
-                _speakerDevice = _deviceEnumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Console);
-                _speakerDevice.AudioEndpointVolume.OnVolumeNotification += (data) => WmiController.SetSpeakerMuteLedState(data.Muted);
+                lock (_audioLock)
+                {
+                    _deviceEnumerator = new MMDeviceEnumerator();
+                    _micDevice = _deviceEnumerator.GetDefaultAudioEndpoint(DataFlow.Capture, Role.Communications);
+                    if (_micDevice != null)
+                    {
+                        _micDevice.AudioEndpointVolume.OnVolumeNotification += (data) =>
+                        {
+                            // Post to background thread to avoid potential deadlock with audio system
+                            Task.Run(() => WmiController.SetMicMuteLedState(data.Muted))
+                                .ContinueWith(t => 
+                                {
+                                    if (t.IsFaulted)
+                                        Log($"Background LED update failed: {t.Exception?.InnerException?.Message}", EventLogEntryType.Warning);
+                                }, TaskContinuationOptions.OnlyOnFaulted);
+                        };
+                    }
+
+                    _speakerDevice = _deviceEnumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Console);
+                    if (_speakerDevice != null)
+                    {
+                        _speakerDevice.AudioEndpointVolume.OnVolumeNotification += (data) =>
+                        {
+                            // Post to background thread to avoid potential deadlock with audio system
+                            Task.Run(() => WmiController.SetSpeakerMuteLedState(data.Muted))
+                                .ContinueWith(t =>
+                                {
+                                    if (t.IsFaulted)
+                                        Log($"Background LED update failed: {t.Exception?.InnerException?.Message}", EventLogEntryType.Warning);
+                                }, TaskContinuationOptions.OnlyOnFaulted);
+                        };
+                    }
+
+                    Log("Audio monitors initialized successfully.");
+                }
             }
-            catch (Exception ex) { Log($"Could not initialize audio monitors: {ex.Message}.", EventLogEntryType.Warning); }
+            catch (Exception ex)
+            {
+                Log($"Could not initialize audio monitors: {ex.Message}.", EventLogEntryType.Warning);
+            }
         }
 
         private void CleanupAudioMonitors()
@@ -359,8 +433,37 @@ namespace LenoPwn.Service
             _deviceEnumerator?.Dispose();
         }
 
-        private void ToggleCoreAudioMuteAndLed() { if (_micDevice != null) _micDevice.AudioEndpointVolume.Mute = !_micDevice.AudioEndpointVolume.Mute; }
-        private void ToggleCoreAudioSpeakerMuteAndLed() { if (_speakerDevice != null) _speakerDevice.AudioEndpointVolume.Mute = !_speakerDevice.AudioEndpointVolume.Mute; }
+        private void ToggleCoreAudioMuteAndLed() 
+        { 
+            // Note: This is called within _audioLock from ExecuteAction
+            if (_micDevice != null)
+            {
+                try
+                {
+                    _micDevice.AudioEndpointVolume.Mute = !_micDevice.AudioEndpointVolume.Mute;
+                }
+                catch (Exception ex)
+                {
+                    Log($"Failed to toggle microphone mute: {ex.Message}", EventLogEntryType.Error);
+                }
+            }
+        }
+
+        private void ToggleCoreAudioSpeakerMuteAndLed() 
+        { 
+            // Note: This is called within _audioLock from ExecuteAction
+            if (_speakerDevice != null)
+            {
+                try
+                {
+                    _speakerDevice.AudioEndpointVolume.Mute = !_speakerDevice.AudioEndpointVolume.Mute;
+                }
+                catch (Exception ex)
+                {
+                    Log($"Failed to toggle speaker mute: {ex.Message}", EventLogEntryType.Error);
+                }
+            }
+        }
         #endregion
 
         #region P/Invoke
@@ -394,11 +497,58 @@ namespace LenoPwn.Service
     public static class WmiController
     {
         private const uint MIC_MUTE_LED_ON = 1, MIC_MUTE_LED_OFF = 2, SPEAKER_MUTE_LED_ON = 4, SPEAKER_MUTE_LED_OFF = 5;
-        private static void SetLedFeature(uint fc) { try { using var mc = new ManagementClass(@"\\.\root\WMI", "LENOVO_UTILITY_DATA", null); using var mi = mc.GetInstances().Cast<ManagementObject>().FirstOrDefault(); if (mi == null) return; var ip = mc.GetMethodParameters("SetFeature"); ip["featuretype"] = fc; mi.InvokeMethod("SetFeature", ip, null); } catch { } }
+        private static readonly object _ledLock = new object();
+
+        private static void SetLedFeature(uint fc)
+        {
+            lock (_ledLock)
+            {
+                try
+                {
+                    using var mc = new ManagementClass(@"\\.\root\WMI", "LENOVO_UTILITY_DATA", null);
+                    using var mi = mc.GetInstances().Cast<ManagementObject>().FirstOrDefault();
+                    if (mi == null) return;
+                    var ip = mc.GetMethodParameters("SetFeature");
+                    ip["featuretype"] = fc;
+                    mi.InvokeMethod("SetFeature", ip, null);
+                }
+                catch
+                {
+                    // Silent fail - WMI might not be available on all systems
+                }
+            }
+        }
+
         public static void SetMicMuteLedState(bool isMuted) => SetLedFeature(isMuted ? MIC_MUTE_LED_ON : MIC_MUTE_LED_OFF);
         public static void SetSpeakerMuteLedState(bool isMuted) => SetLedFeature(isMuted ? SPEAKER_MUTE_LED_ON : SPEAKER_MUTE_LED_OFF);
-        public static void SyncMicMuteLed() { try { using var e = new MMDeviceEnumerator(); using var m = e.GetDefaultAudioEndpoint(DataFlow.Capture, Role.Communications); if (m != null) SetMicMuteLedState(m.AudioEndpointVolume.Mute); } catch { } }
-        public static void SyncSpeakerMuteLed() { try { using var e = new MMDeviceEnumerator(); using var s = e.GetDefaultAudioEndpoint(DataFlow.Render, Role.Console); if (s != null) SetSpeakerMuteLedState(s.AudioEndpointVolume.Mute); } catch { } }
+
+        public static void SyncMicMuteLed()
+        {
+            try
+            {
+                using var e = new MMDeviceEnumerator();
+                using var m = e.GetDefaultAudioEndpoint(DataFlow.Capture, Role.Communications);
+                if (m != null) SetMicMuteLedState(m.AudioEndpointVolume.Mute);
+            }
+            catch
+            {
+                // Silent fail
+            }
+        }
+
+        public static void SyncSpeakerMuteLed()
+        {
+            try
+            {
+                using var e = new MMDeviceEnumerator();
+                using var s = e.GetDefaultAudioEndpoint(DataFlow.Render, Role.Console);
+                if (s != null) SetSpeakerMuteLedState(s.AudioEndpointVolume.Mute);
+            }
+            catch
+            {
+                // Silent fail
+            }
+        }
     }
 
     public static class CancellationTokenExtensions
