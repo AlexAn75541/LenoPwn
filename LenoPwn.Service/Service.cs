@@ -38,13 +38,17 @@ namespace LenoPwn.Service
         private readonly object _configLock = new object();
         private readonly object _audioLock = new object(); // Synchronize audio device access
         private readonly object _pipeLock = new object(); // Synchronize pipe writes
+        private readonly object _lifecycleLock = new object();
         private ConcurrentDictionary<uint, DateTime> _lastKeyPressTime = new(); // Track last key press for debouncing - thread-safe
+        private Task? _workerTask;
+        private bool _restartInProgress;
 
         public LenoPwnService()
         {
             this.ServiceName = "LenoPwn.Service";
             this.CanStop = true;
             this.CanPauseAndContinue = false;
+            this.CanHandlePowerEvent = true;
             this.AutoLog = false;
         }
 
@@ -57,19 +61,121 @@ namespace LenoPwn.Service
 
         protected override void OnStart(string[] args)
         {
-            _cancellationTokenSource = new CancellationTokenSource();
-            Task.Run(() => ServiceWorker(_cancellationTokenSource.Token));
+            StartWorker();
         }
 
         protected override void OnStop()
         {
-            _cancellationTokenSource?.Cancel();
-            _pipeWriter?.Dispose();
-            _pipeClient?.Dispose();
+            StopWorkerAsync().GetAwaiter().GetResult();
+            CleanupRuntimeState();
+        }
+
+        protected override bool OnPowerEvent(PowerBroadcastStatus powerStatus)
+        {
+            if (powerStatus == PowerBroadcastStatus.ResumeSuspend)
+            {
+                Log("Resume detected. Restarting service worker to refresh WMI, audio, and pipe state.");
+                Task.Run(RestartAfterResumeAsync).ContinueWith(t =>
+                {
+                    if (t.IsFaulted)
+                    {
+                        Log($"Resume restart failed: {t.Exception?.GetBaseException().Message}", EventLogEntryType.Error);
+                    }
+                }, TaskContinuationOptions.ExecuteSynchronously);
+                return true;
+            }
+
+            return base.OnPowerEvent(powerStatus);
+        }
+
+        private void StartWorker()
+        {
+            lock (_lifecycleLock)
+            {
+                _cancellationTokenSource = new CancellationTokenSource();
+                _workerTask = Task.Run(() => ServiceWorker(_cancellationTokenSource.Token));
+            }
+        }
+
+        private async Task StopWorkerAsync()
+        {
+            Task? workerTask;
+            CancellationTokenSource? cts;
+
+            lock (_lifecycleLock)
+            {
+                workerTask = _workerTask;
+                cts = _cancellationTokenSource;
+                _workerTask = null;
+                _cancellationTokenSource = null;
+            }
+
+            cts?.Cancel();
+
+            if (workerTask != null)
+            {
+                try
+                {
+                    await workerTask.ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                }
+                catch (Exception ex)
+                {
+                    Log($"Service worker stopped with error: {ex.Message}", EventLogEntryType.Warning);
+                }
+            }
+        }
+
+        private void CleanupRuntimeState()
+        {
+            lock (_lifecycleLock)
+            {
+                _lastKeyPressTime.Clear();
+            }
+
             _watcher?.Stop();
             _watcher?.Dispose();
+            _watcher = null;
+
+            _pipeWriter?.Dispose();
+            _pipeWriter = null;
+
+            _pipeClient?.Dispose();
+            _pipeClient = null;
+
             _configWatcher?.Dispose();
+            _configWatcher = null;
+
             CleanupAudioMonitors();
+        }
+
+        private async Task RestartAfterResumeAsync()
+        {
+            lock (_lifecycleLock)
+            {
+                if (_restartInProgress)
+                {
+                    return;
+                }
+
+                _restartInProgress = true;
+            }
+
+            try
+            {
+                await StopWorkerAsync().ConfigureAwait(false);
+                CleanupRuntimeState();
+                StartWorker();
+            }
+            finally
+            {
+                lock (_lifecycleLock)
+                {
+                    _restartInProgress = false;
+                }
+            }
         }
 
         private async Task ServiceWorker(CancellationToken token)
