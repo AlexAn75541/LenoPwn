@@ -38,13 +38,17 @@ namespace LenoPwn.Service
         private readonly object _configLock = new object();
         private readonly object _audioLock = new object(); // Synchronize audio device access
         private readonly object _pipeLock = new object(); // Synchronize pipe writes
+        private readonly object _lifecycleLock = new object();
         private ConcurrentDictionary<uint, DateTime> _lastKeyPressTime = new(); // Track last key press for debouncing - thread-safe
+        private Task? _workerTask;
+        private bool _restartInProgress;
 
         public LenoPwnService()
         {
             this.ServiceName = "LenoPwn.Service";
             this.CanStop = true;
             this.CanPauseAndContinue = false;
+            this.CanHandlePowerEvent = true;
             this.AutoLog = false;
         }
 
@@ -57,19 +61,121 @@ namespace LenoPwn.Service
 
         protected override void OnStart(string[] args)
         {
-            _cancellationTokenSource = new CancellationTokenSource();
-            Task.Run(() => ServiceWorker(_cancellationTokenSource.Token));
+            StartWorker();
         }
 
         protected override void OnStop()
         {
-            _cancellationTokenSource?.Cancel();
-            _pipeWriter?.Dispose();
-            _pipeClient?.Dispose();
+            StopWorkerAsync().GetAwaiter().GetResult();
+            CleanupRuntimeState();
+        }
+
+        protected override bool OnPowerEvent(PowerBroadcastStatus powerStatus)
+        {
+            if (powerStatus == PowerBroadcastStatus.ResumeSuspend)
+            {
+                Log("Resume detected. Restarting service worker to refresh WMI, audio, and pipe state.");
+                Task.Run(RestartAfterResumeAsync).ContinueWith(t =>
+                {
+                    if (t.IsFaulted)
+                    {
+                        Log($"Resume restart failed: {t.Exception?.GetBaseException().Message}", EventLogEntryType.Error);
+                    }
+                }, TaskContinuationOptions.ExecuteSynchronously);
+                return true;
+            }
+
+            return base.OnPowerEvent(powerStatus);
+        }
+
+        private void StartWorker()
+        {
+            lock (_lifecycleLock)
+            {
+                _cancellationTokenSource = new CancellationTokenSource();
+                _workerTask = Task.Run(() => ServiceWorker(_cancellationTokenSource.Token));
+            }
+        }
+
+        private async Task StopWorkerAsync()
+        {
+            Task? workerTask;
+            CancellationTokenSource? cts;
+
+            lock (_lifecycleLock)
+            {
+                workerTask = _workerTask;
+                cts = _cancellationTokenSource;
+                _workerTask = null;
+                _cancellationTokenSource = null;
+            }
+
+            cts?.Cancel();
+
+            if (workerTask != null)
+            {
+                try
+                {
+                    await workerTask.ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                }
+                catch (Exception ex)
+                {
+                    Log($"Service worker stopped with error: {ex.Message}", EventLogEntryType.Warning);
+                }
+            }
+        }
+
+        private void CleanupRuntimeState()
+        {
+            lock (_lifecycleLock)
+            {
+                _lastKeyPressTime.Clear();
+            }
+
             _watcher?.Stop();
             _watcher?.Dispose();
+            _watcher = null;
+
+            _pipeWriter?.Dispose();
+            _pipeWriter = null;
+
+            _pipeClient?.Dispose();
+            _pipeClient = null;
+
             _configWatcher?.Dispose();
+            _configWatcher = null;
+
             CleanupAudioMonitors();
+        }
+
+        private async Task RestartAfterResumeAsync()
+        {
+            lock (_lifecycleLock)
+            {
+                if (_restartInProgress)
+                {
+                    return;
+                }
+
+                _restartInProgress = true;
+            }
+
+            try
+            {
+                await StopWorkerAsync().ConfigureAwait(false);
+                CleanupRuntimeState();
+                StartWorker();
+            }
+            finally
+            {
+                lock (_lifecycleLock)
+                {
+                    _restartInProgress = false;
+                }
+            }
         }
 
         private async Task ServiceWorker(CancellationToken token)
@@ -93,16 +199,19 @@ namespace LenoPwn.Service
                 {
                     try
                     {
-                        _pipeClient?.Dispose();
-                        _pipeClient = new NamedPipeClientStream(".", PipeName, PipeDirection.Out, PipeOptions.Asynchronous);
-                        Log("Attempting to connect to agent pipe...");
+                        if (_pipeClient == null || !_pipeClient.IsConnected)
+                        {
+                            ResetPipeConnection();
+                            _pipeClient = new NamedPipeClientStream(".", PipeName, PipeDirection.Out, PipeOptions.Asynchronous);
+                            Log("Attempting to connect to agent pipe...");
 
-                        await _pipeClient.ConnectAsync(5000, token);
-                        _pipeClient.WriteTimeout = 1000; // Set timeout once after connection
-                        _pipeWriter = new StreamWriter(_pipeClient, Encoding.UTF8) { AutoFlush = true };
-                        Log("Successfully connected to agent pipe!");
+                            await _pipeClient.ConnectAsync(5000, token);
+                            _pipeClient.WriteTimeout = 1000;
+                            _pipeWriter = new StreamWriter(_pipeClient, Encoding.UTF8) { AutoFlush = true };
+                            Log("Successfully connected to agent pipe!");
+                        }
 
-                        await token.AsTask().ContinueWith(t => { }, TaskContinuationOptions.OnlyOnCanceled);
+                        await Task.Delay(1000, token);
                     }
                     catch (OperationCanceledException)
                     {
@@ -112,13 +221,13 @@ namespace LenoPwn.Service
                     catch (System.TimeoutException)
                     {
                         Log("Timeout connecting to agent pipe. Will retry in 5 seconds...", EventLogEntryType.Warning);
-                        _pipeClient?.Dispose();
+                        ResetPipeConnection();
                         await Task.Delay(5000, token);
                     }
                     catch (Exception ex)
                     {
                         Log($"Pipe client error: {ex.Message}. Will retry in 5 seconds...", EventLogEntryType.Warning);
-                        _pipeClient?.Dispose();
+                        ResetPipeConnection();
                         await Task.Delay(5000, token);
                     }
                 }
@@ -255,20 +364,26 @@ namespace LenoPwn.Service
                     catch (IOException ex)
                     {
                         Log($"Pipe write error: {ex.Message}", EventLogEntryType.Warning);
-                        _pipeClient?.Dispose();
-                        _pipeClient = null;
-                        _pipeWriter?.Dispose();
-                        _pipeWriter = null;
+                        ResetPipeConnection();
                     }
                     catch (System.TimeoutException ex)
                     {
                         Log($"Pipe write timeout: {ex.Message}", EventLogEntryType.Warning);
-                        _pipeClient?.Dispose();
-                        _pipeClient = null;
-                        _pipeWriter?.Dispose();
-                        _pipeWriter = null;
+                        ResetPipeConnection();
                     }
                 }
+            }
+        }
+
+        private void ResetPipeConnection()
+        {
+            lock (_pipeLock)
+            {
+                _pipeWriter?.Dispose();
+                _pipeWriter = null;
+
+                _pipeClient?.Dispose();
+                _pipeClient = null;
             }
         }
 
@@ -384,38 +499,13 @@ namespace LenoPwn.Service
         {
             try
             {
+                CleanupAudioMonitors();
+
                 lock (_audioLock)
                 {
                     _deviceEnumerator = new MMDeviceEnumerator();
                     _micDevice = _deviceEnumerator.GetDefaultAudioEndpoint(DataFlow.Capture, Role.Communications);
-                    if (_micDevice != null)
-                    {
-                        _micDevice.AudioEndpointVolume.OnVolumeNotification += (data) =>
-                        {
-                            // Post to background thread to avoid potential deadlock with audio system
-                            Task.Run(() => WmiController.SetMicMuteLedState(data.Muted))
-                                .ContinueWith(t => 
-                                {
-                                    if (t.IsFaulted)
-                                        Log($"Background LED update failed: {t.Exception?.InnerException?.Message}", EventLogEntryType.Warning);
-                                }, TaskContinuationOptions.OnlyOnFaulted);
-                        };
-                    }
-
                     _speakerDevice = _deviceEnumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Console);
-                    if (_speakerDevice != null)
-                    {
-                        _speakerDevice.AudioEndpointVolume.OnVolumeNotification += (data) =>
-                        {
-                            // Post to background thread to avoid potential deadlock with audio system
-                            Task.Run(() => WmiController.SetSpeakerMuteLedState(data.Muted))
-                                .ContinueWith(t =>
-                                {
-                                    if (t.IsFaulted)
-                                        Log($"Background LED update failed: {t.Exception?.InnerException?.Message}", EventLogEntryType.Warning);
-                                }, TaskContinuationOptions.OnlyOnFaulted);
-                        };
-                    }
 
                     Log("Audio monitors initialized successfully.");
                 }
@@ -428,40 +518,63 @@ namespace LenoPwn.Service
 
         private void CleanupAudioMonitors()
         {
-            _micDevice?.Dispose();
-            _speakerDevice?.Dispose();
-            _deviceEnumerator?.Dispose();
+            lock (_audioLock)
+            {
+                _micDevice?.Dispose();
+                _speakerDevice?.Dispose();
+                _deviceEnumerator?.Dispose();
+
+                _micDevice = null;
+                _speakerDevice = null;
+                _deviceEnumerator = null;
+            }
         }
 
         private void ToggleCoreAudioMuteAndLed() 
         { 
             // Note: This is called within _audioLock from ExecuteAction
-            if (_micDevice != null)
+            try
             {
-                try
+                using var deviceEnumerator = new MMDeviceEnumerator();
+                using var micDevice = deviceEnumerator.GetDefaultAudioEndpoint(DataFlow.Capture, Role.Communications);
+
+                if (micDevice == null)
                 {
-                    _micDevice.AudioEndpointVolume.Mute = !_micDevice.AudioEndpointVolume.Mute;
+                    Log("Failed to toggle microphone mute: no capture device is available.", EventLogEntryType.Warning);
+                    return;
                 }
-                catch (Exception ex)
-                {
-                    Log($"Failed to toggle microphone mute: {ex.Message}", EventLogEntryType.Error);
-                }
+
+                var newMuteState = !micDevice.AudioEndpointVolume.Mute;
+                micDevice.AudioEndpointVolume.Mute = newMuteState;
+                WmiController.SetMicMuteLedState(newMuteState);
+            }
+            catch (Exception ex)
+            {
+                Log($"Failed to toggle microphone mute: {ex.Message}", EventLogEntryType.Error);
             }
         }
 
         private void ToggleCoreAudioSpeakerMuteAndLed() 
         { 
             // Note: This is called within _audioLock from ExecuteAction
-            if (_speakerDevice != null)
+            try
             {
-                try
+                using var deviceEnumerator = new MMDeviceEnumerator();
+                using var speakerDevice = deviceEnumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Console);
+
+                if (speakerDevice == null)
                 {
-                    _speakerDevice.AudioEndpointVolume.Mute = !_speakerDevice.AudioEndpointVolume.Mute;
+                    Log("Failed to toggle speaker mute: no render device is available.", EventLogEntryType.Warning);
+                    return;
                 }
-                catch (Exception ex)
-                {
-                    Log($"Failed to toggle speaker mute: {ex.Message}", EventLogEntryType.Error);
-                }
+
+                var newMuteState = !speakerDevice.AudioEndpointVolume.Mute;
+                speakerDevice.AudioEndpointVolume.Mute = newMuteState;
+                WmiController.SetSpeakerMuteLedState(newMuteState);
+            }
+            catch (Exception ex)
+            {
+                Log($"Failed to toggle speaker mute: {ex.Message}", EventLogEntryType.Error);
             }
         }
         #endregion
