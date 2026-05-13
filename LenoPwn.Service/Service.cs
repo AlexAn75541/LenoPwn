@@ -41,6 +41,8 @@ namespace LenoPwn.Service
         private readonly object _lifecycleLock = new object();
         private ConcurrentDictionary<uint, DateTime> _lastKeyPressTime = new(); // Track last key press for debouncing - thread-safe
         private Task? _workerTask;
+        private Task? _monitorTask;
+        private long _lastHeartbeatTicks = DateTime.UtcNow.Ticks;
         private bool _restartInProgress;
 
         public LenoPwnService()
@@ -94,36 +96,42 @@ namespace LenoPwn.Service
             {
                 _cancellationTokenSource = new CancellationTokenSource();
                 _workerTask = Task.Run(() => ServiceWorker(_cancellationTokenSource.Token));
+                _monitorTask = Task.Run(() => MonitorAndRestoreAsync(_cancellationTokenSource.Token));
             }
         }
 
         private async Task StopWorkerAsync()
         {
             Task? workerTask;
+            Task? monitorTask;
             CancellationTokenSource? cts;
 
             lock (_lifecycleLock)
             {
                 workerTask = _workerTask;
+                monitorTask = _monitorTask;
                 cts = _cancellationTokenSource;
                 _workerTask = null;
+                _monitorTask = null;
                 _cancellationTokenSource = null;
             }
 
             cts?.Cancel();
 
-            if (workerTask != null)
+            var tasks = new List<Task?> { workerTask, monitorTask }.Where(t => t != null).Cast<Task>().ToArray();
+
+            if (tasks.Length > 0)
             {
                 try
                 {
-                    await workerTask.ConfigureAwait(false);
+                    await Task.WhenAll(tasks).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException)
                 {
                 }
                 catch (Exception ex)
                 {
-                    Log($"Service worker stopped with error: {ex.Message}", EventLogEntryType.Warning);
+                    Log($"Service worker/monitor stopped with error: {ex.Message}", EventLogEntryType.Warning);
                 }
             }
         }
@@ -178,6 +186,54 @@ namespace LenoPwn.Service
             }
         }
 
+        private async Task MonitorAndRestoreAsync(CancellationToken token)
+        {
+            const int monitorIntervalMs = 30000;
+            var threshold = TimeSpan.FromMinutes(5);
+
+            while (!token.IsCancellationRequested)
+            {
+                try
+                {
+                    await Task.Delay(monitorIntervalMs, token);
+                    if (token.IsCancellationRequested) break;
+
+                    Task? currentWorker;
+                    lock (_lifecycleLock)
+                    {
+                        currentWorker = _workerTask;
+                    }
+
+                    if (currentWorker == null || currentWorker.IsCompleted)
+                    {
+                        Log("Service worker task is not running. Attempting restart.", EventLogEntryType.Warning);
+                        await RestartAfterResumeAsync().ConfigureAwait(false);
+                        continue;
+                    }
+
+                    var elapsed = TimeSpan.FromTicks(DateTime.UtcNow.Ticks - Interlocked.Read(ref _lastHeartbeatTicks));
+                    if (elapsed > threshold)
+                    {
+                        Log($"Detected possible extended sleep/standby: heartbeat stale ({elapsed}). Restarting worker.", EventLogEntryType.Warning);
+                        await RestartAfterResumeAsync().ConfigureAwait(false);
+                        continue;
+                    }
+
+                    if (_watcher == null)
+                    {
+                        Log("WMI watcher is null. Attempting restart.", EventLogEntryType.Warning);
+                        await RestartAfterResumeAsync().ConfigureAwait(false);
+                        continue;
+                    }
+                }
+                catch (OperationCanceledException) { break; }
+                catch (Exception ex)
+                {
+                    Log($"Monitor encountered exception: {ex.Message}", EventLogEntryType.Warning);
+                }
+            }
+        }
+
         private async Task ServiceWorker(CancellationToken token)
         {
             try
@@ -199,6 +255,7 @@ namespace LenoPwn.Service
                 {
                     try
                     {
+                        Interlocked.Exchange(ref _lastHeartbeatTicks, DateTime.UtcNow.Ticks);
                         if (_pipeClient == null || !_pipeClient.IsConnected)
                         {
                             ResetPipeConnection();
