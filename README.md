@@ -1,3 +1,6 @@
+
+# They whole project has been implemented into [LenovoLegionToolkit project](https://github.com/LenovoLegionToolkit-Team/LenovoLegionToolkit) at the newest Action `dev` build, it is recommended to make the switch to said project to have more of them Vantage alternative goodies!!
+### This project has been forked for the sole reason to fix the F1/F4 light issues on 2026 ThinkBooks. but the above project has done it so well therefore I'm archiving this one.
 <div align="center">
   <img src=".assets/LenoPwn.png" alt="LenoPwn Logo" width="1200"/>
 </div>
